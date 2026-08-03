@@ -147,19 +147,43 @@ class xFuserWanImageToVideoPipeline(WanImageToVideoPipeline):
                 device, dtype=torch.float32
             )
 
-        latents_outputs = self.prepare_latents(
-            image,
-            batch_size * num_videos_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            num_frames,
-            torch.float32,
-            device,
-            generator,
-            latents,
-            last_image,
-        )
+        # VAE encode timing: wrap self.vae.encode for the duration of prepare_latents
+        # so we measure only the encoder GPU time (image/video condition -> latents).
+        self._vae_encode_time = None
+        self._vae_decode_time = None
+        _vae_encode_ms = 0.0
+        _orig_vae_encode = self.vae.encode
+
+        def _timed_vae_encode(*enc_args, **enc_kwargs):
+            nonlocal _vae_encode_ms
+            _enc_start = torch.cuda.Event(enable_timing=True)
+            _enc_end = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize()
+            _enc_start.record()
+            _enc_out = _orig_vae_encode(*enc_args, **enc_kwargs)
+            _enc_end.record()
+            torch.cuda.synchronize()
+            _vae_encode_ms += _enc_start.elapsed_time(_enc_end)
+            return _enc_out
+
+        self.vae.encode = _timed_vae_encode
+        try:
+            latents_outputs = self.prepare_latents(
+                image,
+                batch_size * num_videos_per_prompt,
+                num_channels_latents,
+                height,
+                width,
+                num_frames,
+                torch.float32,
+                device,
+                generator,
+                latents,
+                last_image,
+            )
+        finally:
+            self.vae.encode = _orig_vae_encode
+        self._vae_encode_time = _vae_encode_ms / 1000.0  # seconds
         if self.config.expand_timesteps:
             # wan 2.2 5b i2v use firt_frame_mask to mask timesteps
             latents, condition, first_frame_mask = latents_outputs
@@ -269,7 +293,15 @@ class xFuserWanImageToVideoPipeline(WanImageToVideoPipeline):
                 latents.device, latents.dtype
             )
             latents = latents / latents_std + latents_mean
+            # VAE decode timing: latents -> video frames.
+            _dec_start = torch.cuda.Event(enable_timing=True)
+            _dec_end = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize()
+            _dec_start.record()
             video = self.vae.decode(latents, return_dict=False)[0]
+            _dec_end.record()
+            torch.cuda.synchronize()
+            self._vae_decode_time = _dec_start.elapsed_time(_dec_end) / 1000.0  # seconds
             video = self.video_processor.postprocess_video(video, output_type=output_type)
         else:
             video = latents

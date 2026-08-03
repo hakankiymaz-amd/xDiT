@@ -451,6 +451,10 @@ class xFuserModel(abc.ABC):
                 warmup_args["prompt"] = warmup_args["prompt"][: self.config.batch_size]
             self._run_warmup_calls(warmup_args)
 
+        # VAE sub-timings collected alongside e2e_latency; reset so warmup is excluded.
+        self._vae_encode_times = []
+        self._vae_decode_times = []
+
         inference_start = torch.cuda.Event(enable_timing=True)
         inference_end = torch.cuda.Event(enable_timing=True)
         torch.cuda.synchronize()
@@ -474,6 +478,10 @@ class xFuserModel(abc.ABC):
 
         if len(timings) > 1:
             timings.pop(0) # Remove first timing for more accurate average # TODO: fix
+            # Keep VAE sub-timings aligned with the e2e_latency list.
+            if len(self._vae_encode_times) > 1:
+                self._vae_encode_times.pop(0)
+                self._vae_decode_times.pop(0)
         log(f"Average time over {self.config.num_iterations} runs: {sum(timings) / len(timings):.2f}s")
         log(f"Total time spent: {inference_start.elapsed_time(inference_end) / 1000:.2f}s")
 
@@ -596,6 +604,16 @@ class xFuserModel(abc.ABC):
             json.dump(timings, timing_file, indent=2)
         log(f"Timings saved to {self.config.output_directory}/timings.json")
 
+        # VAE sub-timings are saved to a separate file so timings.json (e2e_latency)
+        # is left in its original bare per-iteration float-list form.
+        vae_encode = getattr(self, "_vae_encode_times", [])
+        vae_decode = getattr(self, "_vae_decode_times", [])
+        if vae_encode or vae_decode:
+            vae_file_name = f"{self.config.output_directory}/vae_timings.json"
+            with open(vae_file_name, "w") as vae_file:
+                json.dump({"vae_encode": vae_encode, "vae_decode": vae_decode}, vae_file, indent=2)
+            log(f"VAE timings saved to {self.config.output_directory}/vae_timings.json")
+
     def save_profile(self, profile: torch.profiler.profiler.profile) -> None:
         profile_file = f"{self.config.output_directory}/profile_trace_rank_{get_world_group().rank}.json.gz"
         profile.export_chrome_trace(profile_file)
@@ -614,6 +632,14 @@ class xFuserModel(abc.ABC):
 
         torch.cuda.synchronize()
         elapsed_time = start.elapsed_time(end) / 1000  # Convert to seconds
+
+        # Collect VAE sub-timings alongside (populated by instrumented pipelines,
+        # e.g. Wan I2V; None otherwise). The e2e_latency value/return is unchanged.
+        self._vae_encode_times = getattr(self, "_vae_encode_times", [])
+        self._vae_decode_times = getattr(self, "_vae_decode_times", [])
+        self._vae_encode_times.append(getattr(self.pipe, "_vae_encode_time", None))
+        self._vae_decode_times.append(getattr(self.pipe, "_vae_decode_time", None))
+
         return out, elapsed_time
 
     def get_output_name(self, input_args) -> str:
