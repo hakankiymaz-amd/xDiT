@@ -136,27 +136,43 @@ def _load_distilled_weights(model: torch.nn.Module, path: str) -> None:
     model.load_state_dict(remapped, strict=True)
 
 
-def _distilled_scheduler_sigmas() -> torch.Tensor:
-    """Sigmas (including terminal 0) for Wan2.2 I2V 4-step distilled schedule.
+def _distilled_scheduler_sigmas(num_inference_steps: int = 4) -> torch.Tensor:
+    """Sigmas (including terminal 0) for the Wan2.2 I2V distilled schedule.
 
-    LightX2V distilled Wan2.2 uses sample_shift=5 and denoising_step_list=[1000, 750, 500, 250]:
-      σ_linear indices [0, 250, 500, 750] → shifted → [1.0, 0.9375, 0.8333, 0.625]
-      timesteps = σ * 1000               →           [1000, 937.5, 833.3, 625.0]
+    LightX2V distilled Wan2.2 uses sample_shift=5 with an evenly-spaced
+    denoising_step_list. For the canonical 4-step schedule this is
+    [1000, 750, 500, 250] (σ_linear indices [0, 250, 500, 750] → shifted →
+    [1.0, 0.9375, 0.8333, 0.625]); for a general N steps it is
+    linspace(1000, 0, N + 1)[:-1], i.e. σ_linear indices linspace(0, 1000, N + 1)[:-1].
+
+    NOTE: the distilled weights were trained for the 4-step schedule; other step
+    counts are supported mechanically but are not guaranteed to improve quality.
     """
     sample_shift = 5.0
     sigma_linear = torch.linspace(1.0, 0.0, 1001)[:-1]
     sigma_shifted = sample_shift * sigma_linear / (1.0 + (sample_shift - 1.0) * sigma_linear)
-    indices = [0, 250, 500, 750]  # 1000 - [1000, 750, 500, 250]
+    denoising_step_list = torch.linspace(1000, 0, num_inference_steps + 1)[:-1]
+    indices = (
+        (1000 - denoising_step_list)
+        .round()
+        .long()
+        .clamp_(0, sigma_shifted.shape[0] - 1)
+        .tolist()
+    )
     return torch.cat([sigma_shifted[indices], torch.zeros(1)])
 
 
 class _DistilledWanScheduler(FlowMatchEulerDiscreteScheduler):
-    """FlowMatchEulerDiscreteScheduler with fixed 4-step sigmas for LightX2V Wan2.2 distilled inference."""
+    """FlowMatchEulerDiscreteScheduler with LightX2V Wan2.2 distilled sigmas.
+
+    Defaults to the canonical 4-step schedule but honours any ``num_inference_steps``
+    passed to ``set_timesteps``.
+    """
 
     def set_timesteps(self, num_inference_steps, device=None, **kwargs):
         self.num_inference_steps = num_inference_steps
         dev = torch.device(device) if device else torch.device("cpu")
-        sigmas = _distilled_scheduler_sigmas().to(dev)
+        sigmas = _distilled_scheduler_sigmas(num_inference_steps).to(dev)
         self.sigmas = sigmas
         self.timesteps = sigmas[:-1] * self.config.num_train_timesteps
         self._step_index = None
@@ -408,11 +424,11 @@ class xFuserWan22DistilledI2VModel(xFuserWan22I2VModel):
                 "(path to low-noise safetensors file)."
             )
         steps = input_args.get("num_inference_steps")
-        if steps != 4:
-            raise ValueError(
-                f"Wan2.2-Distilled-I2V uses a fixed 4-step schedule; "
-                f"num_inference_steps must be 4, got {steps}."
-            )
+        #if steps != 4:
+        #    raise ValueError(
+        #        f"Wan2.2-Distilled-I2V uses a fixed 4-step schedule; "
+        #        f"num_inference_steps must be 4, got {steps}."
+        #    )
         guidance_scale = input_args.get("guidance_scale")
         if guidance_scale != 1.0:
             log(f"Using guidance_scale=1.0. Other guindance scale values are not supported with this model.")
